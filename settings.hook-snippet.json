@@ -1,0 +1,16 @@
+{
+  "_comment": "Merge this into the \"hooks\" object of ~/.claude/settings.json. If a UserPromptSubmit array already exists, append this entry to it instead of replacing the array.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "/rename",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/rename-session-hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}

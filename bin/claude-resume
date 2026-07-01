@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Resume a named Claude Code session: claude-resume [name] [-- extra claude args]
+# Delete a saved session:            claude-resume --delete <name|#>
+set -euo pipefail
+
+MAP_FILE="$HOME/.claude/session-names.json"
+LIB_DIR="$HOME/.claude/lib"
+
+[[ -f "$MAP_FILE" ]] || { echo "No sessions saved yet." >&2; exit 1; }
+
+if [[ "${1:-}" == "--delete" || "${1:-}" == "-d" ]]; then
+  DEL_NAME="${2:-}"
+  [[ -z "$DEL_NAME" ]] && { echo "Usage: claude-resume --delete <name|#>" >&2; exit 1; }
+  PYTHONPATH="$LIB_DIR" python3 -c "
+import sys
+from session_map import locked_map
+target = sys.argv[1]
+with locked_map() as data:
+    name = target
+    if target.isdigit():
+        rows = sorted(data.items(), key=lambda x: x[1].get('saved_at', ''), reverse=True)
+        idx = int(target) - 1
+        if idx < 0 or idx >= len(rows):
+            print(f\"No session numbered {target}.\", file=sys.stderr)
+            sys.exit(1)
+        name = rows[idx][0]
+    if name not in data:
+        print(f\"No session named '{name}'.\", file=sys.stderr)
+        sys.exit(1)
+    del data[name]
+print(f\"Deleted '{name}'.\")
+" "$DEL_NAME"
+  exit $?
+fi
+
+NAME="${1:-}"
+shift || true
+
+# Sync session-names.json: pick up JSONL custom-title renames, prune entries
+# whose transcript or saved cwd no longer exists on disk.
+PYTHONPATH="$LIB_DIR" python3 <<'PYEOF'
+import json, os, subprocess, datetime
+from session_map import locked_map, MAP_FILE
+
+projects_dir = os.path.join(os.path.dirname(MAP_FILE), "projects")
+
+with locked_map() as data:
+    for stored_name, entry in list(data.items()):
+        sid = entry.get("session_id", "")
+        cwd = entry.get("cwd", "")
+        if not sid or not cwd or not os.path.isdir(cwd):
+            # Saved working directory is gone — drop the stale entry.
+            del data[stored_name]
+            continue
+        result = subprocess.run(
+            ["find", projects_dir, "-name", f"{sid}.jsonl"],
+            capture_output=True, text=True
+        )
+        jsonl_path = result.stdout.strip()
+        if not jsonl_path or not os.path.exists(jsonl_path):
+            # Transcript gone — drop the stale entry.
+            del data[stored_name]
+            continue
+        lines = subprocess.run(
+            ["grep", "-F", '"custom-title"', jsonl_path],
+            capture_output=True, text=True
+        ).stdout.splitlines()
+        current_title = None
+        for line in lines:
+            try:
+                rec = json.loads(line)
+                if rec.get("type") == "custom-title" and rec.get("sessionId") == sid:
+                    t = rec.get("customTitle", "").strip()
+                    if t:
+                        current_title = t
+            except: pass
+        if current_title and current_title != stored_name:
+            del data[stored_name]
+            data[current_title] = {**entry, "saved_at": datetime.datetime.now().isoformat()}
+PYEOF
+
+if [[ -z "$NAME" ]]; then
+  # Interactive fzf selection
+  SELECTION=$(python3 -c "
+import json
+with open('$MAP_FILE') as f:
+    data = json.load(f)
+rows = sorted(data.items(), key=lambda x: x[1].get('saved_at',''), reverse=True)
+idxs = [str(i) for i in range(1, len(rows) + 1)]
+names = [n for n, v in rows]
+cwds = [v.get('cwd','?') for n, v in rows]
+def fmt_saved(s):
+    s = s[:19]
+    return f\"{s[:10]}-[{s[11:19]}]\" if len(s) >= 19 else s
+saveds = [fmt_saved(v.get('saved_at','?')) for n, v in rows]
+w_idx = max([len('#')] + [len(x) for x in idxs])
+w_name = max([len('NAME')] + [len(x) for x in names])
+w_cwd = max([len('PATH')] + [len(x) for x in cwds])
+w_saved = max([len('SAVED_AT')] + [len(x) for x in saveds])
+print(f\"{'#'.ljust(w_idx)}\t{'NAME'.ljust(w_name)}\t{'PATH'.ljust(w_cwd)}\t{'SAVED_AT'.ljust(w_saved)}\")
+for i, (n, v) in zip(idxs, rows):
+    saved = fmt_saved(v.get('saved_at','?'))
+    print(f\"{i.ljust(w_idx)}\t{n.ljust(w_name)}\t{v.get('cwd','?').ljust(w_cwd)}\t{saved.ljust(w_saved)}\")
+" | fzf --prompt="Session: " --with-nth=1,2,3,4 --delimiter=$'\t' --header-lines=1 | cut -f2 | sed 's/[[:space:]]*$//')
+  [[ -z "$SELECTION" ]] && exit 0
+  NAME="$SELECTION"
+fi
+
+# Tab-separated output avoids ambiguity with spaces in paths
+SESSION_INFO=$(python3 -c "
+import json, sys
+with open('$MAP_FILE') as f:
+    data = json.load(f)
+e = data.get(sys.argv[1])
+if not e:
+    sys.exit(1)
+print(e['session_id'] + '\t' + e.get('cwd', ''))
+" "$NAME" 2>/dev/null) || { echo "No session named '$NAME'." >&2; exit 1; }
+
+SESSION_ID="${SESSION_INFO%%$'\t'*}"
+SESSION_CWD="${SESSION_INFO#*$'\t'}"
+
+[[ -z "$SESSION_ID" ]] && { echo "No session named '$NAME'." >&2; exit 1; }
+
+if [[ -n "$SESSION_CWD" ]]; then
+  if [[ -d "$SESSION_CWD" ]]; then
+    cd "$SESSION_CWD"
+  else
+    echo "Error: saved cwd '$SESSION_CWD' no longer exists — removing '$NAME' from session-names.json." >&2
+    PYTHONPATH="$LIB_DIR" python3 -c "
+import sys
+from session_map import locked_map
+name = sys.argv[1]
+with locked_map() as data:
+    data.pop(name, None)
+" "$NAME"
+    exit 1
+  fi
+fi
+
+exec claude --resume "$SESSION_ID" "$@"

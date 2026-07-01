@@ -1,0 +1,42 @@
+flowchart TD
+    subgraph A["a) Save & name on exit"]
+        U1["User runs: claude ..."] --> ZF["zsh function claude()\n~/.zshrc (wraps real binary)"]
+        ZF --> BIN["command claude (real binary)"]
+        BIN -->|"transcript written live"| JSONL["~/.claude/projects/&lt;proj-hash&gt;/&lt;sid&gt;.jsonl"]
+        BIN -->|"user types /rename foo mid-session (optional)"| RENAME["built-in /rename command"]
+        RENAME -->|"writes custom-title record"| JSONL
+        RENAME -->|"UserPromptSubmit, matcher=/rename"| HOOK1["rename-session-hook.py"]
+        HOOK1 -->|"locked_map(): name -> {session_id,cwd,saved_at}"| MAP["~/.claude/session-names.json\n(guarded by session-names.json.lock)"]
+        BIN -->|"process exits, rc captured"| STTY["stty sane\n(resets tty after TUI exit)"]
+        STTY --> ZF
+        ZF -->|"finds newest *.jsonl in proj dir"| JSONL
+        ZF -->|"no 'user' message in jsonl? skip naming"| SKIP["empty-session guard: return early"]
+        ZF -->|"greps JSONL for custom-title"| JSONL
+        ZF -->|"else falls back: scan session-names.json for session_id"| MAP
+        ZF -->|"if a name already exists: locked_map() sync/update entry"| MAP
+        ZF -->|"if no name yet: vared prompt 'Name this session...'"| U2["User types a name (or Enter for tmp_X)"]
+        U2 --> ZF
+        ZF -->|"locked_map(): write name -> {session_id,cwd,saved_at}"| MAP
+    end
+
+    subgraph B["b) Resume / manage a session"]
+        U3["User runs: claude-resume [name] | --delete &lt;name|#&gt;"] --> CR["claude-resume script\n~/.claude/bin/claude-resume"]
+        CR -->|"--delete: locked_map(), drop by name or # index"| MAP
+        CR -->|"sync pass (locked_map()): prune entries whose cwd no longer exists"| MAP
+        CR -->|"sync pass: prune entries whose transcript .jsonl is gone"| MAP
+        CR -->|"sync pass: re-check JSONL custom-title vs map, rename map key if stale"| MAP
+        CR -->|"if no NAME arg: build numbered, padded, aligned table"| FZF["fzf interactive picker\n# | NAME | PATH | SAVED_AT"]
+        MAP --> FZF
+        FZF -->|"selected NAME"| CR
+        CR -->|"look up session_id + cwd"| MAP
+        CR -->|"cwd missing at resume time?"| GONE["error + locked_map() removes entry, exit 1"]
+        GONE --> MAP
+        CR -->|"cwd OK: cd into saved cwd"| CWD2["target working directory"]
+        CR -->|"exec claude --resume <session_id>"| BIN2["real claude binary, transcript resumed"]
+        BIN2 --> JSONL
+    end
+
+    LIB["session_map.py: locked_map()\nflock on session-names.json.lock\n(single point of truth for all writers)"]
+    HOOK1 -.-> LIB
+    ZF -.-> LIB
+    CR -.-> LIB

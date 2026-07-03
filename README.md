@@ -1,13 +1,16 @@
 # Claude named-session save/resume — setup
 
-Replicates: auto-prompt to name a Claude Code session on exit, and
-`claude-resume` to pick it back up by name (or via an fzf picker).
+Replicates: auto-prompt to name a Claude Code session on exit,
+`claude-resume` to pick it back up by name (or via an fzf picker), and
+`claude-search` to find a past session by what was said in it.
 
 ## What's in this directory
 
 ```
 Claude-save/
 ├── bin/claude-resume              -> ~/.claude/bin/claude-resume
+├── bin/claude-search               -> ~/.claude/bin/claude-search
+├── bin/test_claude_search.py       -> self-check for claude-search, not installed
 ├── lib/session_map.py             -> ~/.claude/lib/session_map.py
 ├── hooks/rename-session-hook.py   -> ~/.claude/hooks/rename-session-hook.py
 ├── zshrc-snippet.sh               -> append into ~/.zshrc
@@ -53,9 +56,10 @@ permanently, follow option B instead.
    ```bash
    mkdir -p ~/.claude/bin ~/.claude/lib ~/.claude/hooks
    cp bin/claude-resume     ~/.claude/bin/claude-resume
+   cp bin/claude-search     ~/.claude/bin/claude-search
    cp lib/session_map.py    ~/.claude/lib/session_map.py
    cp hooks/rename-session-hook.py ~/.claude/hooks/rename-session-hook.py
-   chmod +x ~/.claude/bin/claude-resume
+   chmod +x ~/.claude/bin/claude-resume ~/.claude/bin/claude-search
    ```
 
 2. **Wire the hook into `~/.claude/settings.json`.**
@@ -124,7 +128,8 @@ flowchart TD
         CR -->|"sync pass (locked_map()): prune entries whose cwd no longer exists"| MAP
         CR -->|"sync pass: prune entries whose transcript .jsonl is gone"| MAP
         CR -->|"sync pass: re-check JSONL custom-title vs map, rename map key if stale"| MAP
-        CR -->|"if no NAME arg: build numbered, padded, aligned table"| FZF["fzf interactive picker\n# | NAME | PATH | SAVED_AT"]
+        CR -->|"sync pass: seek to usage_scan_offset, read only new JSONL bytes, add to tokens_in/out"| MAP
+        CR -->|"if no NAME arg: build numbered, padded, aligned, colorized table + TOTAL row"| FZF["fzf --ansi interactive picker\n# | NAME | PATH | IN | OUT | SAVED_AT\n(header-lines=2: column header + TOTAL)"]
         MAP --> FZF
         FZF -->|"selected NAME"| CR
         CR -->|"look up session_id + cwd"| MAP
@@ -158,13 +163,52 @@ flowchart TD
   duration of each read-modify-write — prevents concurrent Claude sessions from
   clobbering each other's writes.
 - `claude-resume [name]` re-syncs the map first (picks up `/rename` changes made
-  mid-session, and prunes any entry whose saved `cwd` no longer exists or whose
-  transcript file is gone), then either resumes `name` directly or, with no
-  argument, shows an `fzf` picker (columns: `#`, `NAME`, `PATH`, `SAVED_AT`) and
-  resumes whatever you select. It `cd`s into the session's saved directory before
-  calling `claude --resume <session_id>`.
+  mid-session, prunes any entry whose saved `cwd` no longer exists or whose
+  transcript file is gone, and updates `tokens_in`/`tokens_out` per session —
+  `IN` sums `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`
+  across every assistant turn, `OUT` sums `output_tokens`; no cost/pricing is
+  calculated, just raw token counts), then either resumes `name` directly or,
+  with no argument, shows an `fzf` picker (columns: `#`, `NAME`, `PATH`, `IN`,
+  `OUT`, `SAVED_AT`) and resumes whatever you select. It `cd`s into the
+  session's saved directory before calling `claude --resume <session_id>`.
+  - **Incremental token scan**: each entry stores `usage_scan_offset` (byte
+    offset into its `.jsonl` already accounted for). Every sync only reads
+    bytes appended since the last run and adds to the running `tokens_in`/
+    `tokens_out` totals, instead of re-scanning the whole transcript — cheap
+    even for large, long-running sessions. If the offset is ever ahead of the
+    current file size (transcript truncated/rotated), the scan resets to 0
+    and recomputes from scratch.
+  - **Total row**: the picker's header shows a non-selectable `TOTAL` row
+    (`header-lines=2`) summing `IN`/`OUT` across every saved session.
+  - **`--sort-tokens`**: `claude-resume --sort-tokens` shows the picker sorted
+    by `tokens_in + tokens_out` descending (heaviest sessions first) instead
+    of the default `saved_at` descending.
+  - **Color cues**: in the picker, a session's `IN`/`OUT` numbers are
+    highlighted red if its total tokens exceed 10M, yellow above 2M, plain
+    otherwise (`fzf --ansi`) — a quick visual flag for token-heavy sessions.
 - `claude-resume --delete <name|#>` (or `-d`) removes an entry by name or by the
   `#` index shown in the picker.
+- `claude-search QUERY [--project SUBSTR] [--limit N] [--case-sensitive] [--list]`
+  scans every `~/.claude/projects/*/*.jsonl` transcript for user/assistant
+  messages matching `QUERY`, resolves each match's session name via
+  `session-names.json` (falling back to the short session id), and renders an
+  aligned table — same shape as `claude-resume`'s picker — with columns `#`,
+  `NAME`, `PATH`, `IN`, `OUT`, `WHEN`, `SNIPPET` (the matched query is
+  highlighted red in the snippet when output is a terminal), most recent
+  match first, deduped so a session with many hits only shows its latest one.
+  `IN`/`OUT` are read straight from `session-names.json` — `claude-search`
+  doesn't rescan transcripts itself, it reuses whatever `claude-resume`'s
+  sync pass last computed (`0`/`0` for a session that's never been through
+  `claude-resume`). Same as `claude-resume`'s picker, there's a non-selectable
+  `TOTAL` row (`header-lines=2`) summing `IN`/`OUT` across all matches, and
+  each row's `IN`/`OUT` are colorized red (>10M tokens) / yellow (>2M) when
+  output is a terminal. Run interactively with `fzf` on `PATH`, the table is
+  piped straight into `fzf`; selecting a row `cd`s into that session's saved
+  cwd and `exec`s `claude --resume <session_id>` — no separate
+  `claude-resume` call needed. Pass `--list` (or pipe the output) to just
+  print the table instead. It does not modify any state, so it needs no
+  lock. `claude-search --project claude-saver "search"` narrows by project
+  directory.
 
 ## Files this setup creates at runtime (not part of the install)
 

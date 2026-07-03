@@ -1,13 +1,14 @@
 ---
 name: claude-resume-setup
-description: Install the named-session save/resume setup (claude() shell wrapper, claude-resume CLI, /rename hook, locked session-names.json) onto this machine. Use when the user asks to set up, install, or replicate session naming/resume on a new computer, or mentions "claude-resume setup" or this skill's bundled files.
+description: Install the named-session save/resume setup (claude() shell wrapper, claude-resume CLI, claude-search CLI, /rename hook, locked session-names.json) onto this machine. Use when the user asks to set up, install, or replicate session naming/resume/search on a new computer, or mentions "claude-resume setup" or this skill's bundled files.
 ---
 
 # Install claude-resume setup
 
 Installs everything from this skill's directory onto the current machine so
-`claude` auto-prompts to name a session on exit, and `claude-resume` can
-resume it later by name or via an fzf picker. Source of truth: the files
+`claude` auto-prompts to name a session on exit, `claude-resume` can resume
+it later by name or via an fzf picker, and `claude-search` can find a past
+session by what was said in it. Source of truth: the files
 bundled alongside this SKILL.md (`bin/`, `lib/`, `hooks/`, `zshrc-snippet.sh`,
 `settings.hook-snippet.json`). Full design notes are in `README.md` next to
 this file — read it if anything below is ambiguous.
@@ -27,9 +28,10 @@ Run all four checks; if any fail, tell the user what's missing and stop.
    ```bash
    mkdir -p ~/.claude/bin ~/.claude/lib ~/.claude/hooks
    cp <skill_dir>/bin/claude-resume          ~/.claude/bin/claude-resume
+   cp <skill_dir>/bin/claude-search          ~/.claude/bin/claude-search
    cp <skill_dir>/lib/session_map.py         ~/.claude/lib/session_map.py
    cp <skill_dir>/hooks/rename-session-hook.py ~/.claude/hooks/rename-session-hook.py
-   chmod +x ~/.claude/bin/claude-resume
+   chmod +x ~/.claude/bin/claude-resume ~/.claude/bin/claude-search
    ```
    (`<skill_dir>` is wherever this SKILL.md lives, e.g.
    `~/.claude/skills/claude-resume-setup`.)
@@ -65,6 +67,7 @@ Run all four checks; if any fail, tell the user what's missing and stop.
    ```bash
    source ~/.zshrc   # or open a new terminal
    which claude-resume   # -> ~/.claude/bin/claude-resume
+   which claude-search   # -> ~/.claude/bin/claude-search
    type claude            # -> shows the shell function, not just a binary path
    ```
 

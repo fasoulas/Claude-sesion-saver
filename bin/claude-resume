@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Resume a named Claude Code session: claude-resume [name] [-- extra claude args]
 # Delete a saved session:            claude-resume --delete <name|#>
+# Sort picker by token usage:        claude-resume --sort-tokens
 set -euo pipefail
 
 MAP_FILE="$HOME/.claude/session-names.json"
@@ -31,6 +32,12 @@ with locked_map() as data:
 print(f\"Deleted '{name}'.\")
 " "$DEL_NAME"
   exit $?
+fi
+
+SORT_MODE="saved_at"
+if [[ "${1:-}" == "--sort-tokens" ]]; then
+  SORT_MODE="tokens"
+  shift
 fi
 
 NAME="${1:-}"
@@ -74,6 +81,38 @@ with locked_map() as data:
                     if t:
                         current_title = t
             except: pass
+
+        # Incremental usage scan: only read bytes appended since the last sync
+        # (offset stored per entry), instead of re-grepping the whole transcript.
+        file_size = os.path.getsize(jsonl_path)
+        scan_offset = entry.get("usage_scan_offset", 0)
+        tokens_in = entry.get("tokens_in", 0)
+        tokens_out = entry.get("tokens_out", 0)
+        if scan_offset > file_size:
+            scan_offset = 0
+            tokens_in = tokens_out = 0
+        if file_size > scan_offset:
+            with open(jsonl_path, "rb") as f:
+                f.seek(scan_offset)
+                chunk = f.read()
+            for line in chunk.decode("utf-8", "ignore").splitlines():
+                if '"usage"' not in line:
+                    continue
+                try:
+                    u = json.loads(line).get("message", {}).get("usage")
+                    if not u:
+                        continue
+                    tokens_in += (
+                        u.get("input_tokens", 0)
+                        + u.get("cache_creation_input_tokens", 0)
+                        + u.get("cache_read_input_tokens", 0)
+                    )
+                    tokens_out += u.get("output_tokens", 0)
+                except: pass
+        entry["tokens_in"] = tokens_in
+        entry["tokens_out"] = tokens_out
+        entry["usage_scan_offset"] = file_size
+
         if current_title and current_title != stored_name:
             del data[stored_name]
             data[current_title] = {**entry, "saved_at": datetime.datetime.now().isoformat()}
@@ -85,23 +124,48 @@ if [[ -z "$NAME" ]]; then
 import json
 with open('$MAP_FILE') as f:
     data = json.load(f)
-rows = sorted(data.items(), key=lambda x: x[1].get('saved_at',''), reverse=True)
+sort_mode = '$SORT_MODE'
+if sort_mode == 'tokens':
+    rows = sorted(data.items(), key=lambda x: x[1].get('tokens_in',0) + x[1].get('tokens_out',0), reverse=True)
+else:
+    rows = sorted(data.items(), key=lambda x: x[1].get('saved_at',''), reverse=True)
 idxs = [str(i) for i in range(1, len(rows) + 1)]
 names = [n for n, v in rows]
 cwds = [v.get('cwd','?') for n, v in rows]
+ins = [f\"{v.get('tokens_in', 0):,}\" for n, v in rows]
+outs = [f\"{v.get('tokens_out', 0):,}\" for n, v in rows]
 def fmt_saved(s):
     s = s[:19]
     return f\"{s[:10]}-[{s[11:19]}]\" if len(s) >= 19 else s
 saveds = [fmt_saved(v.get('saved_at','?')) for n, v in rows]
+total_in = sum(v.get('tokens_in', 0) for n, v in rows)
+total_out = sum(v.get('tokens_out', 0) for n, v in rows)
+total_in_s = f\"{total_in:,}\"
+total_out_s = f\"{total_out:,}\"
 w_idx = max([len('#')] + [len(x) for x in idxs])
 w_name = max([len('NAME')] + [len(x) for x in names])
 w_cwd = max([len('PATH')] + [len(x) for x in cwds])
+w_in = max([len('IN')] + [len(x) for x in ins] + [len(total_in_s)])
+w_out = max([len('OUT')] + [len(x) for x in outs] + [len(total_out_s)])
 w_saved = max([len('SAVED_AT')] + [len(x) for x in saveds])
-print(f\"{'#'.ljust(w_idx)}\t{'NAME'.ljust(w_name)}\t{'PATH'.ljust(w_cwd)}\t{'SAVED_AT'.ljust(w_saved)}\")
+RED, YEL, RST = '\033[31m', '\033[33m', '\033[0m'
+def colorize(padded, total):
+    if total > 10_000_000:
+        return RED + padded + RST
+    if total > 2_000_000:
+        return YEL + padded + RST
+    return padded
+print(f\"{'#'.ljust(w_idx)}\t{'NAME'.ljust(w_name)}\t{'PATH'.ljust(w_cwd)}\t{'IN'.rjust(w_in)}\t{'OUT'.rjust(w_out)}\t{'SAVED_AT'.ljust(w_saved)}\")
+print(f\"{''.ljust(w_idx)}\t{'TOTAL'.ljust(w_name)}\t{''.ljust(w_cwd)}\t{total_in_s.rjust(w_in)}\t{total_out_s.rjust(w_out)}\t{''.ljust(w_saved)}\")
 for i, (n, v) in zip(idxs, rows):
     saved = fmt_saved(v.get('saved_at','?'))
-    print(f\"{i.ljust(w_idx)}\t{n.ljust(w_name)}\t{v.get('cwd','?').ljust(w_cwd)}\t{saved.ljust(w_saved)}\")
-" | fzf --prompt="Session: " --with-nth=1,2,3,4 --delimiter=$'\t' --header-lines=1 | cut -f2 | sed 's/[[:space:]]*$//')
+    tin = f\"{v.get('tokens_in', 0):,}\"
+    tout = f\"{v.get('tokens_out', 0):,}\"
+    total = v.get('tokens_in', 0) + v.get('tokens_out', 0)
+    tin_c = colorize(tin.rjust(w_in), total)
+    tout_c = colorize(tout.rjust(w_out), total)
+    print(f\"{i.ljust(w_idx)}\t{n.ljust(w_name)}\t{v.get('cwd','?').ljust(w_cwd)}\t{tin_c}\t{tout_c}\t{saved.ljust(w_saved)}\")
+" | fzf --ansi --prompt="Session: " --with-nth=1,2,3,4,5,6 --delimiter=$'\t' --header-lines=2 | cut -f2 | sed 's/[[:space:]]*$//')
   [[ -z "$SELECTION" ]] && exit 0
   NAME="$SELECTION"
 fi

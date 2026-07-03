@@ -25,7 +25,8 @@ flowchart TD
         CR -->|"sync pass (locked_map()): prune entries whose cwd no longer exists"| MAP
         CR -->|"sync pass: prune entries whose transcript .jsonl is gone"| MAP
         CR -->|"sync pass: re-check JSONL custom-title vs map, rename map key if stale"| MAP
-        CR -->|"if no NAME arg: build numbered, padded, aligned table"| FZF["fzf interactive picker\n# | NAME | PATH | SAVED_AT"]
+        CR -->|"sync pass: seek to usage_scan_offset, read only new JSONL bytes, add to tokens_in/out"| MAP
+        CR -->|"if no NAME arg: build numbered, padded, aligned, colorized table + TOTAL row"| FZF["fzf --ansi interactive picker\n# | NAME | PATH | IN | OUT | SAVED_AT\n(header-lines=2: column header + TOTAL)"]
         MAP --> FZF
         FZF -->|"selected NAME"| CR
         CR -->|"look up session_id + cwd"| MAP

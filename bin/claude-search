@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Search across all Claude Code session transcripts.
+
+Usage:
+  claude-search QUERY [--project SUBSTR] [--limit N] [--case-sensitive] [--list]
+
+Scans every ~/.claude/projects/*/*.jsonl transcript for user/assistant
+messages matching QUERY, restricted to sessions that have a name in
+session-names.json (unnamed sessions are skipped). Results are shown as an
+aligned table (same shape as claude-resume's picker: # | NAME | PATH | IN |
+OUT | WHEN | SNIPPET), one row per matching session (most recent match
+first). IN/OUT are read from session-names.json, as last computed by
+claude-resume's sync pass (0 if that session has never been through
+claude-resume). When run
+interactively with fzf on PATH, the table is piped through fzf and the
+selected session is resumed directly (cd into its saved cwd, exec `claude
+--resume <session_id>`) — pass --list to just print the table instead.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.expanduser("~/.claude/lib"))
+from session_map import MAP_FILE  # noqa: E402
+
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+RED = "\033[31m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
+
+def compile_pattern(query, case_sensitive):
+    return re.compile(re.escape(query), 0 if case_sensitive else re.IGNORECASE)
+
+
+def highlight(text, pattern):
+    return pattern.sub(lambda m: RED + m.group(0) + RESET, text)
+
+
+def colorize_tokens(padded, total):
+    """Same thresholds as claude-resume's picker: red >10M, yellow >2M tokens."""
+    if total > 10_000_000:
+        return RED + padded + RESET
+    if total > 2_000_000:
+        return YELLOW + padded + RESET
+    return padded
+
+
+def load_names():
+    try:
+        with open(MAP_FILE) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    return {v["session_id"]: name for name, v in data.items() if "session_id" in v}
+
+
+def load_tokens():
+    """sid -> (tokens_in, tokens_out), as last computed by claude-resume's sync pass."""
+    try:
+        with open(MAP_FILE) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    return {
+        v["session_id"]: (v.get("tokens_in", 0), v.get("tokens_out", 0))
+        for v in data.values()
+        if "session_id" in v
+    }
+
+
+def extract_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def format_when(timestamp):
+    """ISO 'YYYY-MM-DDTHH:MM:SS...' -> 'YYYY-MM-DD-[HH:MM:SS]' (matches claude-resume's picker)."""
+    s = timestamp[:19]
+    return f"{s[:10]}-[{s[11:19]}]" if len(s) >= 19 else s
+
+
+def make_snippet(text, pattern, width=80):
+    m = pattern.search(text)
+    if not m:
+        return text[:width].replace("\n", " ")
+    start = max(0, m.start() - width // 2)
+    end = min(len(text), m.end() + width // 2)
+    snippet = text[start:end].replace("\n", " ")
+    return ("…" if start > 0 else "") + snippet + ("…" if end < len(text) else "")
+
+
+def iter_matches(query, project_filter, case_sensitive):
+    pattern = compile_pattern(query, case_sensitive)
+    for path in glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")):
+        project_dir = os.path.basename(os.path.dirname(path))
+        if project_filter and project_filter not in project_dir:
+            continue
+        session_id = os.path.basename(path)[: -len(".jsonl")]
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") not in ("user", "assistant"):
+                    continue
+                text = extract_text(rec.get("message", {}).get("content"))
+                if not text or not pattern.search(text):
+                    continue
+                yield {
+                    "session_id": session_id,
+                    "cwd": rec.get("cwd", ""),
+                    "role": rec.get("type"),
+                    "timestamp": rec.get("timestamp", ""),
+                    "snippet": make_snippet(text, pattern),
+                }
+
+
+def rank_matches(query, project_filter, case_sensitive, named_sids, limit):
+    """Named sessions only — session_id must be present in named_sids."""
+    matches = sorted(
+        iter_matches(query, project_filter, case_sensitive),
+        key=lambda m: m["timestamp"],
+        reverse=True,
+    )
+    seen = {}
+    for m in matches:
+        if m["session_id"] not in named_sids:
+            continue
+        seen.setdefault(m["session_id"], m)  # first-seen = latest, since sorted desc
+    return list(seen.values())[:limit]
+
+
+def build_rows(ranked, names_by_sid, tokens_by_sid, pattern=None, color=False):
+    """Tab-separated rows: header, TOTAL, then one per match:
+    #, NAME, PATH, IN, OUT, WHEN, SNIPPET, then hidden SESSION_ID, CWD.
+
+    IN/OUT come from session-names.json (last computed by claude-resume's sync
+    pass) — claude-search doesn't rescan transcripts itself. Highlighting is
+    applied to the already-padded SNIPPET column so the ANSI codes (zero
+    visual width) don't throw off column alignment. IN/OUT are colorized the
+    same way as claude-resume's picker (red >10M, yellow >2M tokens).
+    """
+    header = ["#", "NAME", "PATH", "IN", "OUT", "WHEN", "SNIPPET"]
+    rows = []
+    raw_tokens = []
+    for i, m in enumerate(ranked, 1):
+        name = names_by_sid.get(m["session_id"], m["session_id"][:8])
+        tin, tout = tokens_by_sid.get(m["session_id"], (0, 0))
+        raw_tokens.append((tin, tout))
+        rows.append([
+            str(i), name, m["cwd"], f"{tin:,}", f"{tout:,}",
+            format_when(m["timestamp"]), m["snippet"], m["session_id"], m["cwd"],
+        ])
+    total_in = sum(t for t, _ in raw_tokens)
+    total_out = sum(t for _, t in raw_tokens)
+    total_row = ["", "TOTAL", "", f"{total_in:,}", f"{total_out:,}", "", ""]
+    widths = [len(h) for h in header]
+    for r in rows + [total_row]:
+        for i in range(len(header)):
+            widths[i] = max(widths[i], len(r[i]))
+    fmt = lambda cols: [c.ljust(w) for c, w in zip(cols, widths)]  # noqa: E731
+    lines = ["\t".join(fmt(header))]
+    lines.append("\t".join(fmt(total_row)))
+    for r, (tin, tout) in zip(rows, raw_tokens):
+        cols = fmt(r[: len(header)])
+        if color:
+            total = tin + tout
+            cols[3] = colorize_tokens(cols[3], total)
+            cols[4] = colorize_tokens(cols[4], total)
+        if color and pattern:
+            cols[6] = highlight(cols[6], pattern)
+        lines.append("\t".join(cols) + "\t" + r[7] + "\t" + r[8])
+    return lines
+
+
+def resume(session_id, cwd):
+    if cwd and os.path.isdir(cwd):
+        os.chdir(cwd)
+    os.execvp("claude", ["claude", "--resume", session_id])
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Search Claude Code session transcripts")
+    ap.add_argument("query")
+    ap.add_argument("--project", help="filter by substring of the project dir name")
+    ap.add_argument("--limit", type=int, default=20)
+    ap.add_argument("--case-sensitive", action="store_true")
+    ap.add_argument("--list", action="store_true", help="print the table only, skip the fzf picker")
+    args = ap.parse_args()
+
+    names_by_sid = load_names()
+    tokens_by_sid = load_tokens()
+    ranked = rank_matches(args.query, args.project, args.case_sensitive, set(names_by_sid), args.limit)
+
+    if not ranked:
+        print("No matches.")
+        return
+
+    pattern = compile_pattern(args.query, args.case_sensitive)
+    color = sys.stdout.isatty()
+    lines = build_rows(ranked, names_by_sid, tokens_by_sid, pattern, color)
+
+    use_fzf = not args.list and sys.stdout.isatty() and shutil.which("fzf")
+    if not use_fzf:
+        for line in lines:
+            print("\t".join(line.split("\t")[:7]))
+        return
+
+    result = subprocess.run(
+        ["fzf", "--ansi", "--prompt=Search: ", "--with-nth=1,2,3,4,5,6,7", "--delimiter=\t", "--header-lines=2"],
+        input="\n".join(lines),
+        text=True,
+        capture_output=True,
+    )
+    selection = result.stdout.strip()
+    if not selection:
+        return
+    fields = selection.split("\t")
+    session_id, cwd = fields[-2], fields[-1]
+    resume(session_id, cwd)
+
+
+if __name__ == "__main__":
+    main()

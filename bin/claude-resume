@@ -2,7 +2,28 @@
 # Resume a named Claude Code session: claude-resume [name] [-- extra claude args]
 # Delete a saved session:            claude-resume --delete <name|#>
 # Sort picker by token usage:        claude-resume --sort-tokens
+# Show usage:                        claude-resume --help
 set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  claude-resume                          Pick a saved session with fzf (newest first)
+  claude-resume <name> [claude args]     Resume the saved session <name>; extra args
+                                         are passed to `claude --resume`
+  claude-resume --sort-tokens            Pick a session, sorted by token usage
+  claude-resume -d, --delete <name|#>    Delete a saved session by name or picker number
+  claude-resume -h, --help               Show this help
+
+Sessions are stored in ~/.claude/session-names.json. Entries whose working
+directory or transcript no longer exists are removed on each run.
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
 
 MAP_FILE="$HOME/.claude/session-names.json"
 LIB_DIR="$HOME/.claude/lib"

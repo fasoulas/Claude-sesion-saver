@@ -188,6 +188,8 @@ flowchart TD
     otherwise (`fzf --ansi`) — a quick visual flag for token-heavy sessions.
 - `claude-resume --delete <name|#>` (or `-d`) removes an entry by name or by the
   `#` index shown in the picker.
+- `claude-resume --help` (or `-h`) prints the usage summary and exits; it's
+  handled before the "no sessions saved yet" check, so it works on a fresh setup.
 - `claude-search QUERY [--project SUBSTR] [--limit N] [--case-sensitive] [--list]`
   scans every `~/.claude/projects/*/*.jsonl` transcript for user/assistant
   messages matching `QUERY`, resolves each match's session name via
